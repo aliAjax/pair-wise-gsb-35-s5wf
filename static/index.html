@@ -1,19 +1,163 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px;color:#16202a}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>大地测量网平差</h1><p>先初始化示例期次，再查看观测、执行平差，并用两个身份完成提交、审核和发布。</p>
-<div class="card"><h2>连接期次</h2><input id="epoch" type="number" value="1" placeholder="期次 ID"><button onclick="loadEpoch()">读取</button><span id="status"></span></div>
-<div class="card"><h2>观测与点数据</h2><button onclick="loadPoints()">点数据</button><button onclick="loadObservations()">观测</button><button onclick="adjust()">执行平差</button><button onclick="loadResults()">平差结果</button><pre id="output">等待操作…</pre></div>
-<div class="card"><h2>审核发布</h2><p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select><button onclick="transition('submit')">提交复核</button><button onclick="transition('approve')">批准</button><button onclick="transition('publish')">发布</button></div>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差 · 观测复核</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;max-width:1120px;margin:32px auto;padding:0 18px;color:#16202a}
+input,select,button{padding:7px;margin:3px;font:inherit}
+button{cursor:pointer;border-radius:6px;border:1px solid #b8c4cf;background:#fff}
+button.primary{background:#2266e0;color:#fff;border-color:#2266e0}
+button.warn{background:#d9534f;color:#fff;border-color:#d9534f}
+button:disabled{opacity:.45;cursor:not-allowed}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}
+table{border-collapse:collapse;width:100%;margin-top:8px;font-size:14px}
+th,td{border:1px solid #dde4ea;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f2f5f8}
+.badge{display:inline-block;padding:1px 9px;border-radius:11px;font-size:12px;color:#fff}
+.pending{background:#e0a800}.confirmed{background:#2e9e5b}.returned{background:#d9534f}
+.outlier{background:#b23;display:inline-block;padding:0 7px;border-radius:9px;color:#fff;font-size:12px}
+.reason{color:#b23;display:block;margin-top:3px}
+.muted{color:#667;font-size:13px}
+#message{margin:8px 0;font-weight:600}
+#message.error{color:#b23}#message.ok{color:#2e7d4f}
+h2{margin:0 0 8px}
+</style></head>
+<body>
+<h1>大地测量网平差 · 观测复核</h1>
+<p>编辑提交期次后，审核员逐条确认边长、角度和高差；发现偏差只退回该条，整期回到草稿，已确认记录保持锁定。</p>
+
+<div class="card">
+  <h2>连接与身份</h2>
+  期次 <input id="epoch" type="number" value="1" placeholder="期次 ID" style="width:90px">
+  <button class="primary" onclick="loadAll()">读取期次</button>
+  &nbsp;&nbsp;身份
+  <input id="user" value="alice" style="width:110px">
+  <select id="role"><option value="editor">editor 编辑</option><option value="reviewer">reviewer 审核员</option><option value="viewer">viewer 查看</option></select>
+  <span id="epstatus" class="muted"></span>
+</div>
+
+<div id="message"></div>
+
+<div class="card">
+  <h2>期次操作</h2>
+  <button onclick="adjust()">执行平差</button>
+  <button class="primary" onclick="transition('submit')">提交复核</button>
+  <button class="primary" onclick="transition('approve')">整期批准</button>
+  <button class="primary" onclick="transition('publish')">发布</button>
+  <span class="muted">批准要求：所有观测逐条确认且受影响精度结果全部复核；审核员不得是创建人或提交人。</span>
+</div>
+
+<div class="card">
+  <h2>观测复核（<span id="obs-summary"></span>）</h2>
+  <table>
+    <thead><tr><th>ID</th><th>类型</th><th>端点</th><th>观测值</th><th>权</th><th>残差 / σ</th><th>复核状态</th><th>操作</th></tr></thead>
+    <tbody id="obs-rows"><tr><td colspan="8" class="muted">请先读取期次</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>点位精度结果</h2>
+  <table>
+    <thead><tr><th>点</th><th>X</th><th>Y</th><th>高程</th><th>σX</th><th>σY</th><th>σ高程</th><th>复核状态</th><th>操作</th></tr></thead>
+    <tbody id="res-rows"><tr><td colspan="9" class="muted">请先执行平差</td></tr></tbody>
+  </table>
+</div>
+
 <script>
-const out=document.querySelector('#output'), status=document.querySelector('#status');
-const headers=()=>({'Content-Type':'application/json','X-User':document.querySelector('#user').value,'X-Role':document.querySelector('#role').value});
-async function req(url,opts={}){const r=await fetch(url,opts);const j=await r.json();out.textContent=JSON.stringify(j,null,2);if(!r.ok)throw Error(j.error||r.status);return j}
-async function loadEpoch(){try{const j=await req('/api/epochs/'+epoch.value);status.textContent=' '+j.status}catch(e){status.textContent=' '+e.message}}
-async function loadPoints(){await req('/api/epochs/'+epoch.value+'/points')}
-async function loadObservations(){await req('/api/epochs/'+epoch.value+'/observations')}
-async function loadResults(){await req('/api/epochs/'+epoch.value+'/results')}
-async function adjust(){await req('/api/epochs/'+epoch.value+'/adjust',{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
-async function transition(action){await req('/api/epochs/'+epoch.value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
+const KIND_LABEL={distance:'边长',angle:'角度',height_difference:'高差'};
+const REVIEW_LABEL={pending:'待复核',confirmed:'已确认',returned:'已退回'};
+const $=s=>document.querySelector(s);
+const headers=()=>({'Content-Type':'application/json','X-User':$('#user').value,'X-Role':$('#role').value});
+const role=()=>$('#role').value, epStatus=()=>window.epochData&&window.epochData.status;
+
+function msg(text,ok){const m=$('#message');m.textContent=text;m.className=ok?'ok':'error'}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function badge(s){return `<span class="badge ${s}">${REVIEW_LABEL[s]||s}</span>`}
+function fmt(v){return v===null||v===undefined?'—':(Math.abs(v)<1e-9?0:Number(v).toFixed(5))}
+
+async function api(url,opts={}){
+  const r=await fetch(url,{...opts,headers:{...headers(),...(opts.headers||{})}});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw Error(j.error||('HTTP '+r.status));
+  return j;
+}
+async function run(fn){try{await fn()}catch(e){msg(e.message,false)}}
+
+async function loadAll(){
+  try{
+    const id=$('#epoch').value;
+    const [ep,obs,res]=await Promise.all([
+      api('/api/epochs/'+id), api('/api/epochs/'+id+'/observations'), api('/api/epochs/'+id+'/results')
+    ]);
+    window.epochData=ep; window.observations=obs.observations||[]; window.results=res.results||[];
+    $('#epstatus').textContent=`期次「${ep.name}」状态：${ep.status}，提交人：${ep.submitted_by||'—'}，创建人：${ep.created_by||'—'}，复核轮次：${ep.review_round||0}`;
+    renderObservations(); renderResults(); msg('期次已加载',true);
+  }catch(e){msg(e.message,false)}
+}
+
+function obsButtons(o){
+  const s=epStatus(), btns=[];
+  if(s==='review'&&role()==='reviewer'){
+    if(o.review_status==='pending'){
+      btns.push(`<button class="primary" onclick="confirmObs(${o.id})">确认</button>`);
+      btns.push(`<button class="warn" onclick="returnObs(${o.id})">退回</button>`);
+    }else if(o.review_status==='returned'){
+      btns.push(`<button disabled>已退回</button>`);
+    }else{
+      btns.push(`<button disabled>已锁定</button>`);
+    }
+  }else if(s==='draft'&&role()==='editor'&&o.review_status==='returned'){
+    btns.push(`<button class="primary" onclick="reviseObs(${o.id})">修订重报</button>`);
+  }
+  return btns.join(' ');
+}
+
+function renderObservations(){
+  const list=window.observations||[];
+  const c=list.filter(o=>o.review_status==='confirmed').length;
+  const r=list.filter(o=>o.review_status==='returned').length;
+  const p=list.filter(o=>o.review_status==='pending').length;
+  $('#obs-summary').textContent=`共 ${list.length} 条 · 已确认 ${c} · 待复核 ${p} · 已退回 ${r}`;
+  if(!list.length){$('#obs-rows').innerHTML='<tr><td colspan="8" class="muted">暂无观测</td></tr>';return}
+  $('#obs-rows').innerHTML=list.map(o=>{
+    const endpoints=o.kind==='angle'?`${o.p1}→${o.p2}→${o.p3||''}`:`${o.p1}—${o.p2}`;
+    const reason=o.review_status==='returned'&&o.return_reason?`<span class="reason">退回原因：${esc(o.return_reason)}（${esc(o.reviewed_by||'')}）</span>`:'';
+    const outlier=o.status==='outlier'?' <span class="outlier">粗差</span>':'';
+    const rev=o.revision?` <span class="muted">第${o.revision+1}版</span>`:'';
+    return `<tr>
+      <td>${o.id}</td><td>${KIND_LABEL[o.kind]||o.kind}</td><td>${endpoints}${rev}</td>
+      <td>${fmt(o.value)}${outlier}</td><td>${fmt(o.weight)}</td>
+      <td>${fmt(o.residual)} / ${fmt(o.sigma)}</td>
+      <td>${badge(o.review_status)}${reason}</td>
+      <td style="white-space:nowrap">${obsButtons(o)}</td></tr>`;
+  }).join('');
+}
+
+function renderResults(){
+  const list=window.results||[];
+  if(!list.length){$('#res-rows').innerHTML='<tr><td colspan="9" class="muted">暂无平差结果</td></tr>';return}
+  $('#res-rows').innerHTML=list.map(r=>{
+    const canConfirm=epStatus()==='review'&&role()==='reviewer'&&r.review_status!=='confirmed';
+    const btn=canConfirm?`<button class="primary" onclick="confirmResult('${r.point}')">复核确认</button>`
+              :r.review_status==='confirmed'?'<button disabled>已锁定</button>':'<span class="muted">待复核</span>';
+    return `<tr><td>${r.point}</td><td>${fmt(r.x)}</td><td>${fmt(r.y)}</td><td>${fmt(r.elevation)}</td>
+      <td>${fmt(r.sigma_x)}</td><td>${fmt(r.sigma_y)}</td><td>${fmt(r.sigma_elevation)}</td>
+      <td>${badge(r.review_status)}${r.reviewed_by?` <span class="muted">${esc(r.reviewed_by)}</span>`:''}</td>
+      <td>${btn}</td></tr>`;
+  }).join('');
+}
+
+async function adjust(){await run(async()=>{await api('/api/epochs/'+$('#epoch').value+'/adjust',{method:'POST',body:'{}'});msg('平差完成：只有变动观测端点相关的精度结果重新待复核',true);await loadAll()})}
+async function transition(action){await run(async()=>{await api('/api/epochs/'+$('#epoch').value+'/transition/'+action,{method:'POST',body:'{}'});msg('操作成功：'+action,true);await loadAll()})}
+async function confirmObs(id){await run(async()=>{await api(`/api/epochs/${$('#epoch').value}/observations/${id}/confirm`,{method:'POST'});msg('观测已确认并锁定',true);await loadAll()})}
+async function returnObs(id){
+  const reason=prompt('请输入退回原因（只退回这一条，其他已确认记录保留）');
+  if(reason===null)return;
+  await run(async()=>{await api(`/api/epochs/${$('#epoch').value}/observations/${id}/return`,{method:'POST',body:JSON.stringify({reason})});msg('该条已退回，期次回到草稿，可由编辑修订',true);await loadAll()})}
+async function reviseObs(id){
+  const value=prompt('输入修订后的观测值（留空表示不改值）','');
+  if(value===null)return;
+  const body={};if(value.trim()!=='')body.value=Number(value);
+  if(!Object.keys(body).length){msg('未填写修订值',false);return}
+  await run(async()=>{const j=await api(`/api/epochs/${$('#epoch').value}/observations/${id}/revise`,{method:'POST',body:JSON.stringify(body)});msg(`观测已修订（第${j.revision+1}版），请重新执行平差后提交`,true);await loadAll()})}
+async function confirmResult(point){await run(async()=>{await api(`/api/epochs/${$('#epoch').value}/results/${encodeURIComponent(point)}/confirm`,{method:'POST'});msg('该点精度结果已复核',true);await loadAll()})}
 </script></body></html>

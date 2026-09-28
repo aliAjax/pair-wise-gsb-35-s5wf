@@ -16,13 +16,19 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "geodetic.db"
 
 KINDS = {"distance", "angle", "height_difference"}
+# draft -> review (submit); review -> approved (all items confirmed) or draft
+# (a single observation is returned); approved -> published.
 STATUS_FLOW = {"draft": {"review"}, "review": {"approved", "draft"}, "approved": {"published"}, "published": set()}
+
+REVIEW_PENDING = "pending"
+REVIEW_CONFIRMED = "confirmed"
+REVIEW_RETURNED = "returned"
 
 
 class DomainError(Exception):
@@ -107,6 +113,8 @@ class Database:
                     submitted_by TEXT,
                     approved_by TEXT,
                     published_at TEXT,
+                    review_round INTEGER NOT NULL DEFAULT 0,
+                    return_round INTEGER,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS points (
@@ -130,6 +138,12 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'valid',
                     residual REAL,
                     sigma REAL,
+                    review_status TEXT NOT NULL DEFAULT 'pending',
+                    return_reason TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    review_round INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS results (
@@ -139,6 +153,9 @@ class Database:
                     x REAL, y REAL, elevation REAL,
                     sigma_x REAL, sigma_y REAL, sigma_elevation REAL,
                     residual_rms REAL NOT NULL,
+                    review_status TEXT NOT NULL DEFAULT 'pending',
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
@@ -151,6 +168,42 @@ class Database:
                 );
                 """
             )
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add per-item review columns to databases created by older versions."""
+
+        def columns(table: str) -> set[str]:
+            return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+        epoch_cols = columns("epochs")
+        if "review_round" not in epoch_cols:
+            conn.execute("ALTER TABLE epochs ADD COLUMN review_round INTEGER NOT NULL DEFAULT 0")
+        if "return_round" not in epoch_cols:
+            conn.execute("ALTER TABLE epochs ADD COLUMN return_round INTEGER")
+        obs_cols = columns("observations")
+        if "review_status" not in obs_cols:
+            conn.execute("ALTER TABLE observations ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'")
+        if "return_reason" not in obs_cols:
+            conn.execute("ALTER TABLE observations ADD COLUMN return_reason TEXT")
+        if "reviewed_by" not in obs_cols:
+            conn.execute("ALTER TABLE observations ADD COLUMN reviewed_by TEXT")
+        if "reviewed_at" not in obs_cols:
+            conn.execute("ALTER TABLE observations ADD COLUMN reviewed_at TEXT")
+        if "revision" not in obs_cols:
+            conn.execute("ALTER TABLE observations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+        if "review_round" not in obs_cols:
+            # Legacy observations belong to the first review round.
+            conn.execute("ALTER TABLE observations ADD COLUMN review_round INTEGER NOT NULL DEFAULT 1")
+        result_cols = columns("results")
+        if "review_status" not in result_cols:
+            # Existing results belonged to epochs already approved under the old flow.
+            conn.execute("ALTER TABLE results ADD COLUMN review_status TEXT NOT NULL DEFAULT 'confirmed'")
+        if "reviewed_by" not in result_cols:
+            conn.execute("ALTER TABLE results ADD COLUMN reviewed_by TEXT")
+        if "reviewed_at" not in result_cols:
+            conn.execute("ALTER TABLE results ADD COLUMN reviewed_at TEXT")
 
     def _audit(self, conn: sqlite3.Connection, epoch_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -235,7 +288,7 @@ class Database:
             raise DomainError("角度应在 0 到 360 度之间")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            epoch = conn.execute("SELECT status FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            epoch = conn.execute("SELECT status,review_round FROM epochs WHERE id=?", (epoch_id,)).fetchone()
             if not epoch:
                 raise DomainError("期次不存在", 404)
             if epoch["status"] != "draft":
@@ -253,8 +306,8 @@ class Database:
             if near and not allow_duplicate:
                 raise DomainError("发现疑似重复观测", 409)
             cur = conn.execute(
-                "INSERT INTO observations(epoch_id,kind,p1,p2,p3,value,weight,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (epoch_id, kind, p1, p2, p3, value, weight, utcnow()),
+                "INSERT INTO observations(epoch_id,kind,p1,p2,p3,value,weight,review_round,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (epoch_id, kind, p1, p2, p3, value, weight, int(epoch["review_round"]) + 1, utcnow()),
             )
             self._audit(conn, epoch_id, actor, "observation.added", {"kind": kind, "p1": p1, "p2": p2, "p3": p3, "value": value})
             return {"id": cur.lastrowid, "duplicate_suspect": bool(near)}
@@ -263,6 +316,133 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM observations WHERE epoch_id=? ORDER BY id", (epoch_id,)).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _load_epoch_for_review(conn: sqlite3.Connection, epoch_id: int, actor: str, role: str,
+                               required_status: str) -> sqlite3.Row:
+        if role != "reviewer":
+            raise DomainError("只有审核员可以执行复核操作", 403)
+        epoch = conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+        if not epoch:
+            raise DomainError("期次不存在", 404)
+        if epoch["status"] != required_status:
+            raise DomainError(f"只有{required_status}状态的期次可以执行该操作", 409)
+        if actor in {epoch["created_by"], epoch["submitted_by"]}:
+            raise DomainError("创建人或提交人不能自行复核", 403)
+        return epoch
+
+    def confirm_observation(self, epoch_id: int, obs_id: int, actor: str, role: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._load_epoch_for_review(conn, epoch_id, actor, role, "review")
+            obs = conn.execute("SELECT * FROM observations WHERE id=? AND epoch_id=?", (obs_id, epoch_id)).fetchone()
+            if not obs:
+                raise DomainError("观测不存在", 404)
+            if obs["review_status"] == REVIEW_CONFIRMED:
+                raise DomainError("该观测已确认，无需重复操作", 409)
+            conn.execute(
+                "UPDATE observations SET review_status='confirmed',return_reason=NULL,reviewed_by=?,reviewed_at=? WHERE id=?",
+                (actor, utcnow(), obs_id),
+            )
+            self._audit(conn, epoch_id, actor, "observation.confirmed",
+                        {"observation_id": obs_id, "revision": obs["revision"]})
+            row = conn.execute("SELECT * FROM observations WHERE id=?", (obs_id,)).fetchone()
+        return dict(row)
+
+    def return_observation(self, epoch_id: int, obs_id: int, reason: str, actor: str, role: str) -> dict[str, Any]:
+        reason = (reason or "").strip()
+        if not reason:
+            raise DomainError("退回必须填写原因")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = self._load_epoch_for_review(conn, epoch_id, actor, role, "review")
+            obs = conn.execute("SELECT * FROM observations WHERE id=? AND epoch_id=?", (obs_id, epoch_id)).fetchone()
+            if not obs:
+                raise DomainError("观测不存在", 404)
+            if obs["review_status"] == REVIEW_CONFIRMED:
+                raise DomainError("已确认的观测已锁定，不能退回", 409)
+            # Only this one record goes back; every confirmed record keeps its verdict
+            # while the epoch returns to draft so the editor can revise the item.
+            returned_round = int(epoch["review_round"])
+            conn.execute(
+                "UPDATE observations SET review_status='returned',return_reason=?,reviewed_by=?,reviewed_at=? WHERE id=?",
+                (reason, actor, utcnow(), obs_id),
+            )
+            conn.execute("UPDATE epochs SET status='draft',submitted_by=NULL,return_round=? WHERE id=?",
+                         (returned_round, epoch_id))
+            self._audit(conn, epoch_id, actor, "observation.returned",
+                        {"observation_id": obs_id, "reason": reason, "revision": obs["revision"],
+                         "review_round": returned_round})
+            row = conn.execute("SELECT * FROM observations WHERE id=?", (obs_id,)).fetchone()
+        return dict(row)
+
+    def revise_observation(self, epoch_id: int, obs_id: int, actor: str, role: str,
+                           value: float | None = None, weight: float | None = None) -> dict[str, Any]:
+        if role != "editor":
+            raise DomainError("只有编辑人员可以修订观测", 403)
+        if value is None and weight is None:
+            raise DomainError("没有需要修订的字段")
+        try:
+            value = None if value is None else float(value)
+            weight = None if weight is None else float(weight)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("观测值和权必须是数值") from exc
+        if value is not None and not math.isfinite(value):
+            raise DomainError("观测值必须是有限数")
+        if weight is not None and (not math.isfinite(weight) or weight <= 0):
+            raise DomainError("权必须大于 0")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = conn.execute("SELECT status,return_round FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            if not epoch:
+                raise DomainError("期次不存在", 404)
+            if epoch["status"] != "draft":
+                raise DomainError("只有草稿期次可以修订观测", 409)
+            obs = conn.execute("SELECT * FROM observations WHERE id=? AND epoch_id=?", (obs_id, epoch_id)).fetchone()
+            if not obs:
+                raise DomainError("观测不存在", 404)
+            if obs["review_status"] == REVIEW_CONFIRMED:
+                raise DomainError("已确认的观测已锁定，不能修改", 409)
+            if obs["review_status"] != REVIEW_RETURNED:
+                raise DomainError("只有被退回的观测需要修订", 409)
+            if value is not None and obs["kind"] == "distance" and value <= 0:
+                raise DomainError("边长观测必须大于 0")
+            if value is not None and obs["kind"] == "angle" and not 0 < value < 360:
+                raise DomainError("角度应在 0 到 360 度之间")
+            new_value = value if value is not None else obs["value"]
+            new_weight = weight if weight is not None else obs["weight"]
+            # A revised record rejoins the next review round; residual/sigma are
+            # stale until the network is adjusted again.
+            next_round = int(epoch["return_round"] or 0) + 1
+            conn.execute(
+                """UPDATE observations SET value=?,weight=?,review_status='pending',return_reason=NULL,
+                   reviewed_by=NULL,reviewed_at=NULL,revision=revision+1,review_round=?,
+                   residual=NULL,sigma=NULL,status='valid' WHERE id=?""",
+                (new_value, new_weight, next_round, obs_id),
+            )
+            self._audit(conn, epoch_id, actor, "observation.revised",
+                        {"observation_id": obs_id, "value": new_value, "weight": new_weight,
+                         "revision": obs["revision"] + 1, "review_round": next_round})
+            row = conn.execute("SELECT * FROM observations WHERE id=?", (obs_id,)).fetchone()
+        return dict(row)
+
+    def confirm_result(self, epoch_id: int, point: str, actor: str, role: str) -> dict[str, Any]:
+        point = point.strip().upper()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._load_epoch_for_review(conn, epoch_id, actor, role, "review")
+            result = conn.execute("SELECT * FROM results WHERE epoch_id=? AND point=?", (epoch_id, point)).fetchone()
+            if not result:
+                raise DomainError("该点没有可复核的平差结果", 404)
+            if result["review_status"] == REVIEW_CONFIRMED:
+                raise DomainError("该点精度结果已确认，无需重复操作", 409)
+            conn.execute(
+                "UPDATE results SET review_status='confirmed',reviewed_by=?,reviewed_at=? WHERE id=?",
+                (actor, utcnow(), result["id"]),
+            )
+            self._audit(conn, epoch_id, actor, "result.confirmed", {"point": point})
+            row = conn.execute("SELECT * FROM results WHERE id=?", (result["id"],)).fetchone()
+        return dict(row)
 
     def transition(self, epoch_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
         if role not in {"editor", "reviewer"}:
@@ -276,20 +456,45 @@ class Database:
             if action == "submit":
                 if role != "editor" or status != "draft":
                     raise DomainError("只有草稿可由编辑提交复核", 409)
-                conn.execute("UPDATE epochs SET status='review',submitted_by=? WHERE id=?", (actor, epoch_id))
+                observations = conn.execute(
+                    "SELECT review_status FROM observations WHERE epoch_id=?", (epoch_id,)
+                ).fetchall()
+                if not observations:
+                    raise DomainError("没有观测，不能提交复核", 409)
+                returned = [r for r in observations if r["review_status"] == REVIEW_RETURNED]
+                if returned:
+                    raise DomainError("仍有被退回的观测尚未修订，不能提交复核", 409)
+                if not conn.execute("SELECT 1 FROM results WHERE epoch_id=? LIMIT 1", (epoch_id,)).fetchone():
+                    raise DomainError("请先执行平差并形成成果，再提交复核", 409)
+                conn.execute("UPDATE epochs SET status='review',submitted_by=?,review_round=review_round+1 WHERE id=?",
+                             (actor, epoch_id))
             elif action == "approve":
                 if role != "reviewer" or status != "review":
                     raise DomainError("只有复核中成果可由审核员批准", 409)
                 if actor in {row["created_by"], row["submitted_by"]}:
                     raise DomainError("创建人或提交人不能自行批准", 403)
+                pending_obs = conn.execute(
+                    "SELECT COUNT(*) AS n FROM observations WHERE epoch_id=? AND review_status!=?",
+                    (epoch_id, REVIEW_CONFIRMED),
+                ).fetchone()["n"]
+                if pending_obs:
+                    raise DomainError(f"还有 {pending_obs} 条观测未逐条确认，不能批准", 409)
+                if not conn.execute("SELECT 1 FROM results WHERE epoch_id=? LIMIT 1", (epoch_id,)).fetchone():
+                    raise DomainError("缺少平差结果，不能批准", 409)
+                pending_results = conn.execute(
+                    "SELECT COUNT(*) AS n FROM results WHERE epoch_id=? AND review_status!=?",
+                    (epoch_id, REVIEW_CONFIRMED),
+                ).fetchone()["n"]
+                if pending_results:
+                    raise DomainError(f"还有 {pending_results} 个受影响精度结果未复核，不能批准", 409)
                 conn.execute("UPDATE epochs SET status='approved',approved_by=? WHERE id=?", (actor, epoch_id))
             elif action == "reject":
-                if role != "reviewer" or status != "review":
-                    raise DomainError("只有复核中成果可以退回", 409)
-                conn.execute("UPDATE epochs SET status='draft',submitted_by=NULL WHERE id=?", (epoch_id,))
+                raise DomainError("整期退回已取消，请在复核中对有问题的单条观测执行退回", 409)
             elif action == "publish":
                 if role != "reviewer" or status != "approved":
                     raise DomainError("只有已批准成果可以发布", 409)
+                if actor in {row["created_by"], row["submitted_by"]}:
+                    raise DomainError("创建人或提交人不能发布", 403)
                 conn.execute("UPDATE epochs SET status='published',published_at=? WHERE id=?", (utcnow(), epoch_id))
             else:
                 raise DomainError("未知状态操作")
@@ -407,24 +612,58 @@ class Database:
                 covariance = [[v * sigma0 * sigma0 for v in row] for row in covariance]
             rms = math.sqrt(sum(r * r for r in residuals) / len(residuals)) if residuals else 0.0
             stamped = utcnow()
+            # Carry over per-point review verdicts: a point keeps its confirmed
+            # status unless an observation touching it was revised/re-added since
+            # the last review round, in which case its precision result is
+            # re-opened for review.
+            prior = {r["point"]: dict(r) for r in conn.execute(
+                "SELECT * FROM results WHERE epoch_id=?", (epoch_id,)
+            ).fetchall()}
+            # A point's confirmed precision verdict carries over unless an
+            # observation touching it entered review *after* the latest
+            # single-record return (a revised record or an observation added in
+            # the resulting draft); first-round pending observations never reopen
+            # already-confirmed points.
+            return_round = epoch["return_round"]
+            affected_points: set[str] = set()
+            if return_round is not None:
+                for obs in observations:
+                    if int(obs["review_round"]) > int(return_round):
+                        affected_points.add(obs["p1"])
+                        affected_points.add(obs["p2"])
+                        if obs["p3"]:
+                            affected_points.add(obs["p3"])
             conn.execute("DELETE FROM results WHERE epoch_id=?", (epoch_id,))
             by_point = {point: {"point": point, "x": p["x"], "y": p["y"], "elevation": p["elevation"],
                                 "sigma_x": 0.0, "sigma_y": 0.0, "sigma_elevation": 0.0} for point, p in points.items()}
             for (point, comp), idx in unknown.items():
                 by_point[point][f"sigma_{comp}"] = math.sqrt(max(0.0, covariance[idx][idx]))
+            reopened = []
             for result in by_point.values():
+                prev = prior.get(result["point"])
+                touched = result["point"] in affected_points
+                if prev and not touched and prev["review_status"] == REVIEW_CONFIRMED:
+                    review_status, reviewed_by, reviewed_at = REVIEW_CONFIRMED, prev["reviewed_by"], prev["reviewed_at"]
+                else:
+                    review_status, reviewed_by, reviewed_at = REVIEW_PENDING, None, None
+                    if prev and touched:
+                        reopened.append(result["point"])
                 conn.execute(
-                    """INSERT INTO results(epoch_id,point,x,y,elevation,sigma_x,sigma_y,sigma_elevation,residual_rms,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO results(epoch_id,point,x,y,elevation,sigma_x,sigma_y,sigma_elevation,residual_rms,
+                       review_status,reviewed_by,reviewed_at,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (epoch_id, result["point"], result["x"], result["y"], result["elevation"], result["sigma_x"],
-                     result["sigma_y"], result["sigma_elevation"], rms, stamped),
+                     result["sigma_y"], result["sigma_elevation"], rms, review_status, reviewed_by, reviewed_at,
+                     stamped),
                 )
             for obs, residual in zip(observations, residuals):
                 sigma_res = abs(residual) / math.sqrt(max(float(obs["weight"]), 1e-12))
                 status = "outlier" if len(observations) - len(unknown) > 0 and abs(math.sqrt(float(obs["weight"])) * residual) > 3.5 * max(sigma0, 1e-12) else "valid"
                 conn.execute("UPDATE observations SET residual=?,sigma=?,status=? WHERE id=?", (residual, sigma_res, status, obs["id"]))
-            self._audit(conn, epoch_id, actor, "network.adjusted", {"iterations": iteration, "rms": rms, "outliers": sum(1 for o, r in zip(observations, residuals) if abs(math.sqrt(float(o["weight"])) * r) > 3.5 * max(sigma0, 1e-12))})
-            return {"epoch_id": epoch_id, "iterations": iteration, "residual_rms": rms, "sigma0": sigma0, "points": list(by_point.values())}
+            self._audit(conn, epoch_id, actor, "network.adjusted", {"iterations": iteration, "rms": rms, "outliers": sum(1 for o, r in zip(observations, residuals) if abs(math.sqrt(float(o["weight"])) * r) > 3.5 * max(sigma0, 1e-12)), "reopened_results": reopened})
+            return {"epoch_id": epoch_id, "iterations": iteration, "residual_rms": rms, "sigma0": sigma0,
+                    "points": list(by_point.values()), "affected_results": sorted(affected_points),
+                    "reopened_results": reopened}
 
     def results(self, epoch_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -549,6 +788,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.db.get_epoch(epoch_id), 201)
             if len(parts) == 5 and parts[:2] == ["api", "epochs"] and parts[3] == "transition":
                 return self._json(self.db.transition(int(parts[2]), actor, role, parts[4]))
+            if len(parts) == 6 and parts[:2] == ["api", "epochs"] and parts[3] == "observations":
+                epoch_id = int(parts[2])
+                obs_id = int(parts[4])
+                if parts[5] == "confirm":
+                    return self._json(self.db.confirm_observation(epoch_id, obs_id, actor, role))
+                if parts[5] == "return":
+                    result = self.db.return_observation(epoch_id, obs_id, str(body.get("reason", "")), actor, role)
+                    return self._json(result)
+                if parts[5] == "revise":
+                    result = self.db.revise_observation(epoch_id, obs_id, actor, role,
+                                                        body.get("value"), body.get("weight"))
+                    return self._json(result)
+            if len(parts) == 6 and parts[:2] == ["api", "epochs"] and parts[3] == "results":
+                epoch_id = int(parts[2])
+                if parts[5] == "confirm":
+                    return self._json(self.db.confirm_result(epoch_id, unquote(parts[4]), actor, role))
             if len(parts) == 4 and parts[:2] == ["api", "epochs"]:
                 epoch_id = int(parts[2])
                 if parts[3] == "points":
