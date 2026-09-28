@@ -22,7 +22,9 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "geodetic.db"
 
 KINDS = {"distance", "angle", "height_difference"}
+REVIEW_PENDING, REVIEW_CONFIRMED, REVIEW_RETURNED = "pending", "confirmed", "returned"
 STATUS_FLOW = {"draft": {"review"}, "review": {"approved", "draft"}, "approved": {"published"}, "published": set()}
+REVIEW_ROLES = {"editor", "reviewer"}
 
 
 class DomainError(Exception):
@@ -107,6 +109,8 @@ class Database:
                     submitted_by TEXT,
                     approved_by TEXT,
                     published_at TEXT,
+                    review_started INTEGER NOT NULL DEFAULT 0,
+                    adjust_required INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS points (
@@ -130,6 +134,11 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'valid',
                     residual REAL,
                     sigma REAL,
+                    review_status TEXT NOT NULL DEFAULT 'pending',
+                    review_reason TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    dirty INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS results (
@@ -139,6 +148,10 @@ class Database:
                     x REAL, y REAL, elevation REAL,
                     sigma_x REAL, sigma_y REAL, sigma_elevation REAL,
                     residual_rms REAL NOT NULL,
+                    review_status TEXT NOT NULL DEFAULT 'pending',
+                    review_reason TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
@@ -151,6 +164,40 @@ class Database:
                 );
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add per-record review columns to databases created before observation review."""
+
+        def columns(table: str) -> set[str]:
+            return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+        epoch_cols = columns("epochs")
+        if "review_started" not in epoch_cols:
+            conn.execute("ALTER TABLE epochs ADD COLUMN review_started INTEGER NOT NULL DEFAULT 0")
+        if "adjust_required" not in epoch_cols:
+            conn.execute(
+                "ALTER TABLE epochs ADD COLUMN adjust_required INTEGER NOT NULL DEFAULT 1"
+            )
+        obs_cols = columns("observations")
+        for name, ddl in (
+            ("review_status", "ALTER TABLE observations ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'"),
+            ("review_reason", "ALTER TABLE observations ADD COLUMN review_reason TEXT"),
+            ("reviewed_by", "ALTER TABLE observations ADD COLUMN reviewed_by TEXT"),
+            ("reviewed_at", "ALTER TABLE observations ADD COLUMN reviewed_at TEXT"),
+            ("dirty", "ALTER TABLE observations ADD COLUMN dirty INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in obs_cols:
+                conn.execute(ddl)
+        result_cols = columns("results")
+        for name, ddl in (
+            ("review_status", "ALTER TABLE results ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'"),
+            ("review_reason", "ALTER TABLE results ADD COLUMN review_reason TEXT"),
+            ("reviewed_by", "ALTER TABLE results ADD COLUMN reviewed_by TEXT"),
+            ("reviewed_at", "ALTER TABLE results ADD COLUMN reviewed_at TEXT"),
+        ):
+            if name not in result_cols:
+                conn.execute(ddl)
 
     def _audit(self, conn: sqlite3.Connection, epoch_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -193,11 +240,13 @@ class Database:
             if value is not None and not math.isfinite(float(value)):
                 raise DomainError("坐标必须是有限数值")
         with self.connect() as conn:
-            epoch = conn.execute("SELECT status FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            epoch = conn.execute("SELECT status,review_started FROM epochs WHERE id=?", (epoch_id,)).fetchone()
             if not epoch:
                 raise DomainError("期次不存在", 404)
             if epoch["status"] != "draft":
                 raise DomainError("只有草稿期次可以修改点数据", 409)
+            if epoch["review_started"]:
+                raise DomainError("复核已启动，点数据已锁定；如需修改请先退回相关观测", 409)
             conn.execute(
                 """INSERT INTO points(epoch_id,point,x,y,elevation,x_known,y_known,elevation_known)
                    VALUES(?,?,?,?,?,?,?,?)
@@ -205,6 +254,7 @@ class Database:
                    x_known=excluded.x_known,y_known=excluded.y_known,elevation_known=excluded.elevation_known""",
                 (epoch_id, point, x, y, elevation, int(x_known), int(y_known), int(elevation_known)),
             )
+            conn.execute("UPDATE epochs SET adjust_required=1 WHERE id=?", (epoch_id,))
             self._audit(conn, epoch_id, actor, "point.saved", {"point": point})
 
     def list_points(self, epoch_id: int) -> list[dict[str, Any]]:
@@ -235,7 +285,7 @@ class Database:
             raise DomainError("角度应在 0 到 360 度之间")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            epoch = conn.execute("SELECT status FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            epoch = conn.execute("SELECT status,review_started FROM epochs WHERE id=?", (epoch_id,)).fetchone()
             if not epoch:
                 raise DomainError("期次不存在", 404)
             if epoch["status"] != "draft":
@@ -253,9 +303,11 @@ class Database:
             if near and not allow_duplicate:
                 raise DomainError("发现疑似重复观测", 409)
             cur = conn.execute(
-                "INSERT INTO observations(epoch_id,kind,p1,p2,p3,value,weight,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                """INSERT INTO observations(epoch_id,kind,p1,p2,p3,value,weight,review_status,dirty,created_at)
+                   VALUES(?,?,?,?,?,?,?,'pending',1,?)""",
                 (epoch_id, kind, p1, p2, p3, value, weight, utcnow()),
             )
+            conn.execute("UPDATE epochs SET adjust_required=1 WHERE id=?", (epoch_id,))
             self._audit(conn, epoch_id, actor, "observation.added", {"kind": kind, "p1": p1, "p2": p2, "p3": p3, "value": value})
             return {"id": cur.lastrowid, "duplicate_suspect": bool(near)}
 
@@ -264,8 +316,208 @@ class Database:
             rows = conn.execute("SELECT * FROM observations WHERE epoch_id=? ORDER BY id", (epoch_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def get_observation_review(self, epoch_id: int, obs_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM observations WHERE id=? AND epoch_id=?", (obs_id, epoch_id)
+            ).fetchone()
+        if not row:
+            raise DomainError("观测不存在", 404)
+        return dict(row)
+
+    def _observation_endpoints(self, kind: str, p1: str, p2: str, p3: str | None) -> set[str]:
+        return {p1, p2} | ({p3} if kind == "angle" and p3 else set())
+
+    def update_observation(self, epoch_id: int, obs_id: int, actor: str, role: str,
+                           changes: dict[str, Any]) -> dict[str, Any]:
+        if role != "editor":
+            raise DomainError("只有编辑人员可以修改观测", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            if not epoch:
+                raise DomainError("期次不存在", 404)
+            if epoch["status"] != "draft":
+                raise DomainError("只有草稿期次可以修改观测", 409)
+            obs = conn.execute("SELECT * FROM observations WHERE id=? AND epoch_id=?", (obs_id, epoch_id)).fetchone()
+            if not obs:
+                raise DomainError("观测不存在", 404)
+            if epoch["review_started"] and obs["review_status"] != REVIEW_RETURNED:
+                raise DomainError("该观测已经复核确认并锁定，不能修改", 409)
+            kind = str(changes.get("kind", obs["kind"]))
+            if kind not in KINDS:
+                raise DomainError("观测类型必须是 distance、angle 或 height_difference")
+            p1 = str(changes.get("p1", obs["p1"])).strip().upper()
+            p2 = str(changes.get("p2", obs["p2"])).strip().upper()
+            p3_value = changes.get("p3", obs["p3"])
+            p3 = p3_value.strip().upper() if p3_value else None
+            if not p1 or not p2 or (kind == "angle" and not p3):
+                raise DomainError("观测端点不完整")
+            endpoints = [p1, p2] + ([p3] if p3 else [])
+            missing = [p for p in endpoints if not conn.execute("SELECT 1 FROM points WHERE epoch_id=? AND point=?", (epoch_id, p)).fetchone()]
+            if missing:
+                raise DomainError("以下点号未定义: " + ", ".join(missing))
+            try:
+                value = float(changes.get("value", obs["value"]))
+                weight = float(changes.get("weight", obs["weight"]))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("观测值和权必须是数值") from exc
+            if not math.isfinite(value) or not math.isfinite(weight) or weight <= 0:
+                raise DomainError("观测值必须是有限数，权必须大于 0")
+            if kind == "distance" and value <= 0:
+                raise DomainError("边长观测必须大于 0")
+            if kind == "angle" and not 0 < value < 360:
+                raise DomainError("角度应在 0 到 360 度之间")
+            duplicate = conn.execute(
+                "SELECT id,value FROM observations WHERE epoch_id=? AND kind=? AND p1=? AND p2=? "
+                "AND COALESCE(p3,'')=COALESCE(?, '') AND id<>? AND status='valid'",
+                (epoch_id, kind, p1, p2, p3, obs_id),
+            ).fetchall()
+            tolerance = {"distance": 0.01, "angle": 1e-4, "height_difference": 0.005}[kind]
+            if any(abs(float(r["value"]) - value) <= tolerance for r in duplicate) and not bool(changes.get("allow_duplicate")):
+                raise DomainError("发现疑似重复观测", 409)
+            before = dict(obs)
+            conn.execute(
+                """UPDATE observations SET kind=?,p1=?,p2=?,p3=?,value=?,weight=?,status='valid',
+                   residual=NULL,sigma=NULL,review_status='pending',review_reason=NULL,
+                   reviewed_by=NULL,reviewed_at=NULL,dirty=1 WHERE id=?""",
+                (kind, p1, p2, p3, value, weight, obs_id),
+            )
+            conn.execute("UPDATE epochs SET adjust_required=1,submitted_by=NULL WHERE id=?", (epoch_id,))
+            affected = self._observation_endpoints(kind, p1, p2, p3) | self._observation_endpoints(
+                before["kind"], before["p1"], before["p2"], before["p3"]
+            )
+            conn.execute(
+                f"UPDATE results SET review_status='pending',review_reason=NULL,reviewed_by=NULL,reviewed_at=NULL "
+                f"WHERE epoch_id=? AND point IN ({','.join('?' for _ in affected)})",
+                [epoch_id, *sorted(affected)],
+            )
+            self._audit(conn, epoch_id, actor, "observation.updated", {
+                "observation_id": obs_id, "reason": before["review_reason"],
+                "before": {"kind": before["kind"], "value": before["value"]},
+                "after": {"kind": kind, "value": value},
+            })
+        return {"id": obs_id, "affected_points": sorted(affected)}
+
+    def delete_observation(self, epoch_id: int, obs_id: int, actor: str, role: str) -> None:
+        if role != "editor":
+            raise DomainError("只有编辑人员可以删除观测", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            if not epoch:
+                raise DomainError("期次不存在", 404)
+            if epoch["status"] != "draft":
+                raise DomainError("只有草稿期次可以删除观测", 409)
+            obs = conn.execute("SELECT * FROM observations WHERE id=? AND epoch_id=?", (obs_id, epoch_id)).fetchone()
+            if not obs:
+                raise DomainError("观测不存在", 404)
+            if epoch["review_started"] and obs["review_status"] != REVIEW_RETURNED:
+                raise DomainError("该观测已经复核确认并锁定，不能删除", 409)
+            conn.execute("DELETE FROM observations WHERE id=?", (obs_id,))
+            conn.execute("UPDATE epochs SET adjust_required=1,submitted_by=NULL WHERE id=?", (epoch_id,))
+            affected = self._observation_endpoints(obs["kind"], obs["p1"], obs["p2"], obs["p3"])
+            conn.execute(
+                f"UPDATE results SET review_status='pending',review_reason=NULL,reviewed_by=NULL,reviewed_at=NULL "
+                f"WHERE epoch_id=? AND point IN ({','.join('?' for _ in affected)})",
+                [epoch_id, *sorted(affected)],
+            )
+            self._audit(conn, epoch_id, actor, "observation.deleted", {
+                "observation_id": obs_id, "kind": obs["kind"], "affected_points": sorted(affected),
+            })
+
+    def _reviewer_guard(self, conn: sqlite3.Connection, epoch: sqlite3.Row, actor: str, role: str) -> None:
+        if role != "reviewer":
+            raise DomainError("只有审核员可以执行复核操作", 403)
+        if actor in {epoch["created_by"], epoch["submitted_by"]}:
+            raise DomainError("创建人或提交人不能自行复核", 403)
+
+    def confirm_observation(self, epoch_id: int, obs_id: int, actor: str, role: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            if not epoch:
+                raise DomainError("期次不存在", 404)
+            if epoch["status"] != "review":
+                raise DomainError("只有复核中期次可以确认观测", 409)
+            self._reviewer_guard(conn, epoch, actor, role)
+            obs = conn.execute("SELECT * FROM observations WHERE id=? AND epoch_id=?", (obs_id, epoch_id)).fetchone()
+            if not obs:
+                raise DomainError("观测不存在", 404)
+            if obs["review_status"] == REVIEW_CONFIRMED:
+                return {"id": obs_id, "review_status": REVIEW_CONFIRMED, "already_confirmed": True}
+            conn.execute(
+                "UPDATE observations SET review_status='confirmed',review_reason=NULL,reviewed_by=?,reviewed_at=? WHERE id=?",
+                (actor, utcnow(), obs_id),
+            )
+            self._audit(conn, epoch_id, actor, "observation.confirmed", {"observation_id": obs_id, "kind": obs["kind"]})
+        return {"id": obs_id, "review_status": REVIEW_CONFIRMED, "already_confirmed": False}
+
+    def return_observation(self, epoch_id: int, obs_id: int, reason: str, actor: str, role: str) -> dict[str, Any]:
+        reason = (reason or "").strip()
+        if not reason:
+            raise DomainError("退回必须填写退回原因")
+        if len(reason) > 500:
+            raise DomainError("退回原因不能超过 500 字")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            if not epoch:
+                raise DomainError("期次不存在", 404)
+            if epoch["status"] != "review":
+                raise DomainError("只有复核中期次可以退回观测", 409)
+            self._reviewer_guard(conn, epoch, actor, role)
+            obs = conn.execute("SELECT * FROM observations WHERE id=? AND epoch_id=?", (obs_id, epoch_id)).fetchone()
+            if not obs:
+                raise DomainError("观测不存在", 404)
+            if obs["review_status"] == REVIEW_RETURNED:
+                raise DomainError("该观测已经退回", 409)
+            conn.execute(
+                "UPDATE observations SET review_status='returned',review_reason=?,reviewed_by=?,reviewed_at=? WHERE id=?",
+                (reason, actor, utcnow(), obs_id),
+            )
+            # 整期回到可修改状态；已经确认的观测保持锁定不动。
+            conn.execute(
+                "UPDATE epochs SET status='draft',adjust_required=1 WHERE id=?", (epoch_id,)
+            )
+            # 受该观测端点影响的精度结果立即撤回，等待重新平差后重审。
+            endpoints = self._observation_endpoints(obs["kind"], obs["p1"], obs["p2"], obs["p3"])
+            conn.execute(
+                f"UPDATE results SET review_status='pending',review_reason=NULL,reviewed_by=NULL,reviewed_at=NULL "
+                f"WHERE epoch_id=? AND point IN ({','.join('?' for _ in endpoints)})",
+                [epoch_id, *sorted(endpoints)],
+            )
+            self._audit(conn, epoch_id, actor, "observation.returned", {
+                "observation_id": obs_id, "kind": obs["kind"], "reason": reason,
+                "affected_points": sorted(endpoints),
+            })
+        return {"id": obs_id, "review_status": REVIEW_RETURNED, "reason": reason,
+                "epoch_status": "draft", "affected_points": sorted(endpoints)}
+
+    def confirm_result(self, epoch_id: int, point: str, actor: str, role: str) -> dict[str, Any]:
+        point = point.strip().upper()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = conn.execute("SELECT * FROM epochs WHERE id=?", (epoch_id,)).fetchone()
+            if not epoch:
+                raise DomainError("期次不存在", 404)
+            if epoch["status"] != "review":
+                raise DomainError("只有复核中期次可以确认精度结果", 409)
+            self._reviewer_guard(conn, epoch, actor, role)
+            result = conn.execute("SELECT * FROM results WHERE epoch_id=? AND point=?", (epoch_id, point)).fetchone()
+            if not result:
+                raise DomainError("该点没有平差精度结果，请先重新平差", 404)
+            if result["review_status"] == REVIEW_CONFIRMED:
+                return {"point": point, "review_status": REVIEW_CONFIRMED, "already_confirmed": True}
+            conn.execute(
+                "UPDATE results SET review_status='confirmed',review_reason=NULL,reviewed_by=?,reviewed_at=? WHERE epoch_id=? AND point=?",
+                (actor, utcnow(), epoch_id, point),
+            )
+            self._audit(conn, epoch_id, actor, "result.confirmed", {"point": point})
+        return {"point": point, "review_status": REVIEW_CONFIRMED, "already_confirmed": False}
+
     def transition(self, epoch_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
-        if role not in {"editor", "reviewer"}:
+        if role not in REVIEW_ROLES:
             raise DomainError("没有审核权限", 403)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -276,24 +528,61 @@ class Database:
             if action == "submit":
                 if role != "editor" or status != "draft":
                     raise DomainError("只有草稿可由编辑提交复核", 409)
-                conn.execute("UPDATE epochs SET status='review',submitted_by=? WHERE id=?", (actor, epoch_id))
+                valid_obs = conn.execute(
+                    "SELECT COUNT(*) AS c FROM observations WHERE epoch_id=? AND status='valid'", (epoch_id,)
+                ).fetchone()["c"]
+                if not valid_obs:
+                    raise DomainError("没有有效观测，不能提交复核", 409)
+                returned = conn.execute(
+                    "SELECT COUNT(*) AS c FROM observations WHERE epoch_id=? AND review_status='returned'", (epoch_id,)
+                ).fetchone()["c"]
+                if returned:
+                    raise DomainError(f"还有 {returned} 条退回观测未修正，不能提交复核", 409)
+                result_count = conn.execute("SELECT COUNT(*) AS c FROM results WHERE epoch_id=?", (epoch_id,)).fetchone()["c"]
+                if not result_count or row["adjust_required"]:
+                    raise DomainError("观测资料有变动，必须重新平差后才能提交复核", 409)
+                # 全部待复核观测（含重新修正的）送审；已确认的记录保持锁定不重来。
+                conn.execute(
+                    "UPDATE observations SET review_status='pending',review_reason=NULL,reviewed_by=NULL,reviewed_at=NULL "
+                    "WHERE epoch_id=? AND review_status<>'confirmed'",
+                    (epoch_id,),
+                )
+                conn.execute(
+                    "UPDATE epochs SET status='review',submitted_by=?,review_started=1 WHERE id=?",
+                    (actor, epoch_id),
+                )
+                details = {"observation_count": valid_obs}
             elif action == "approve":
                 if role != "reviewer" or status != "review":
                     raise DomainError("只有复核中成果可由审核员批准", 409)
                 if actor in {row["created_by"], row["submitted_by"]}:
                     raise DomainError("创建人或提交人不能自行批准", 403)
+                pending_obs = conn.execute(
+                    "SELECT COUNT(*) AS c FROM observations WHERE epoch_id=? AND status='valid' AND review_status<>'confirmed'",
+                    (epoch_id,),
+                ).fetchone()["c"]
+                if pending_obs:
+                    raise DomainError(f"还有 {pending_obs} 条观测未逐条确认，不能批准", 409)
+                pending_results = conn.execute(
+                    "SELECT COUNT(*) AS c FROM results WHERE epoch_id=? AND review_status<>'confirmed'", (epoch_id,)
+                ).fetchone()["c"]
+                result_count = conn.execute("SELECT COUNT(*) AS c FROM results WHERE epoch_id=?", (epoch_id,)).fetchone()["c"]
+                if not result_count:
+                    raise DomainError("没有平差精度结果，不能批准", 409)
+                if pending_results:
+                    raise DomainError(f"还有 {pending_results} 个点位精度结果未确认，不能批准", 409)
                 conn.execute("UPDATE epochs SET status='approved',approved_by=? WHERE id=?", (actor, epoch_id))
+                details = {}
             elif action == "reject":
-                if role != "reviewer" or status != "review":
-                    raise DomainError("只有复核中成果可以退回", 409)
-                conn.execute("UPDATE epochs SET status='draft',submitted_by=NULL WHERE id=?", (epoch_id,))
+                raise DomainError("整期退回已取消，请对有问题的单条观测执行退回", 409)
             elif action == "publish":
                 if role != "reviewer" or status != "approved":
                     raise DomainError("只有已批准成果可以发布", 409)
                 conn.execute("UPDATE epochs SET status='published',published_at=? WHERE id=?", (utcnow(), epoch_id))
+                details = {}
             else:
                 raise DomainError("未知状态操作")
-            self._audit(conn, epoch_id, actor, f"epoch.{action}", {})
+            self._audit(conn, epoch_id, actor, f"epoch.{action}", details)
         return self.get_epoch(epoch_id)
 
     def _linear_system(self, points: dict[str, dict[str, Any]], observations: list[sqlite3.Row]):
@@ -407,24 +696,46 @@ class Database:
                 covariance = [[v * sigma0 * sigma0 for v in row] for row in covariance]
             rms = math.sqrt(sum(r * r for r in residuals) / len(residuals)) if residuals else 0.0
             stamped = utcnow()
+            # 只让变动观测端点上的精度结果重新送审，未受影响且已确认的结果保留锁定。
+            prior_result = {
+                r["point"]: r for r in conn.execute("SELECT * FROM results WHERE epoch_id=?", (epoch_id,)).fetchall()
+            }
+            affected_points: set[str] = set()
+            for obs in observations:
+                if obs["dirty"]:
+                    affected_points |= self._observation_endpoints(obs["kind"], obs["p1"], obs["p2"], obs["p3"])
             conn.execute("DELETE FROM results WHERE epoch_id=?", (epoch_id,))
             by_point = {point: {"point": point, "x": p["x"], "y": p["y"], "elevation": p["elevation"],
                                 "sigma_x": 0.0, "sigma_y": 0.0, "sigma_elevation": 0.0} for point, p in points.items()}
             for (point, comp), idx in unknown.items():
                 by_point[point][f"sigma_{comp}"] = math.sqrt(max(0.0, covariance[idx][idx]))
-            for result in by_point.values():
+            for point, result in by_point.items():
+                prior = prior_result.get(point)
+                if prior is not None and point not in affected_points and prior["review_status"] == REVIEW_CONFIRMED:
+                    review_status, review_reason, reviewed_by, reviewed_at = (
+                        REVIEW_CONFIRMED, prior["review_reason"], prior["reviewed_by"], prior["reviewed_at"])
+                else:
+                    review_status, review_reason, reviewed_by, reviewed_at = REVIEW_PENDING, None, None, None
                 conn.execute(
-                    """INSERT INTO results(epoch_id,point,x,y,elevation,sigma_x,sigma_y,sigma_elevation,residual_rms,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO results(epoch_id,point,x,y,elevation,sigma_x,sigma_y,sigma_elevation,residual_rms,
+                       review_status,review_reason,reviewed_by,reviewed_at,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (epoch_id, result["point"], result["x"], result["y"], result["elevation"], result["sigma_x"],
-                     result["sigma_y"], result["sigma_elevation"], rms, stamped),
+                     result["sigma_y"], result["sigma_elevation"], rms, review_status, review_reason,
+                     reviewed_by, reviewed_at, stamped),
                 )
             for obs, residual in zip(observations, residuals):
                 sigma_res = abs(residual) / math.sqrt(max(float(obs["weight"]), 1e-12))
                 status = "outlier" if len(observations) - len(unknown) > 0 and abs(math.sqrt(float(obs["weight"])) * residual) > 3.5 * max(sigma0, 1e-12) else "valid"
-                conn.execute("UPDATE observations SET residual=?,sigma=?,status=? WHERE id=?", (residual, sigma_res, status, obs["id"]))
-            self._audit(conn, epoch_id, actor, "network.adjusted", {"iterations": iteration, "rms": rms, "outliers": sum(1 for o, r in zip(observations, residuals) if abs(math.sqrt(float(o["weight"])) * r) > 3.5 * max(sigma0, 1e-12))})
-            return {"epoch_id": epoch_id, "iterations": iteration, "residual_rms": rms, "sigma0": sigma0, "points": list(by_point.values())}
+                conn.execute("UPDATE observations SET residual=?,sigma=?,status=?,dirty=0 WHERE id=?", (residual, sigma_res, status, obs["id"]))
+            conn.execute("UPDATE epochs SET adjust_required=0 WHERE id=?", (epoch_id,))
+            self._audit(conn, epoch_id, actor, "network.adjusted", {
+                "iterations": iteration, "rms": rms,
+                "outliers": sum(1 for o, r in zip(observations, residuals) if abs(math.sqrt(float(o["weight"])) * r) > 3.5 * max(sigma0, 1e-12)),
+                "affected_points": sorted(affected_points),
+            })
+            return {"epoch_id": epoch_id, "iterations": iteration, "residual_rms": rms, "sigma0": sigma0,
+                    "points": list(by_point.values()), "affected_points": sorted(affected_points)}
 
     def results(self, epoch_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -526,6 +837,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.db.get_epoch(int(parts[2])))
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "observations":
                 return self._json({"observations": self.db.list_observations(int(parts[2]))})
+            if len(parts) == 6 and parts[:2] == ["api", "epochs"] and parts[3] == "observations" and parts[5] == "review":
+                return self._json({"review": self.db.get_observation_review(int(parts[2]), int(parts[4]))})
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "points":
                 return self._json({"points": self.db.list_points(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "epochs"] and parts[3] == "results":
@@ -549,6 +862,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.db.get_epoch(epoch_id), 201)
             if len(parts) == 5 and parts[:2] == ["api", "epochs"] and parts[3] == "transition":
                 return self._json(self.db.transition(int(parts[2]), actor, role, parts[4]))
+            if len(parts) == 6 and parts[:2] == ["api", "epochs"] and parts[3] == "observations" and parts[5] == "confirm":
+                return self._json(self.db.confirm_observation(int(parts[2]), int(parts[4]), actor, role))
+            if len(parts) == 6 and parts[:2] == ["api", "epochs"] and parts[3] == "observations" and parts[5] == "return":
+                return self._json(self.db.return_observation(int(parts[2]), int(parts[4]),
+                                                             str(body.get("reason", "")), actor, role))
+            if len(parts) == 6 and parts[:2] == ["api", "epochs"] and parts[3] == "results" and parts[5] == "confirm":
+                return self._json(self.db.confirm_result(int(parts[2]), str(parts[4]), actor, role))
             if len(parts) == 4 and parts[:2] == ["api", "epochs"]:
                 epoch_id = int(parts[2])
                 if parts[3] == "points":
@@ -562,6 +882,31 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(result, 201)
                 if parts[3] == "adjust":
                     return self._json(self.db.adjust(epoch_id, actor, role))
+            raise DomainError("接口不存在", 404)
+        except (ValueError, DomainError, TypeError) as exc:
+            self._json({"error": str(exc)}, getattr(exc, "status", 400))
+
+    def do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            body = self._body()
+            actor, role = self._actor()
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 5 and parts[:2] == ["api", "epochs"] and parts[3] == "observations":
+                result = self.db.update_observation(int(parts[2]), int(parts[4]), actor, role, body)
+                return self._json(result)
+            raise DomainError("接口不存在", 404)
+        except (ValueError, DomainError, TypeError) as exc:
+            self._json({"error": str(exc)}, getattr(exc, "status", 400))
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            actor, role = self._actor()
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 5 and parts[:2] == ["api", "epochs"] and parts[3] == "observations":
+                self.db.delete_observation(int(parts[2]), int(parts[4]), actor, role)
+                return self._json({"ok": True})
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError, TypeError) as exc:
             self._json({"error": str(exc)}, getattr(exc, "status", 400))

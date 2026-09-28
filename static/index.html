@@ -1,19 +1,246 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大地测量网平差</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px;color:#16202a}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>大地测量网平差</h1><p>先初始化示例期次，再查看观测、执行平差，并用两个身份完成提交、审核和发布。</p>
-<div class="card"><h2>连接期次</h2><input id="epoch" type="number" value="1" placeholder="期次 ID"><button onclick="loadEpoch()">读取</button><span id="status"></span></div>
-<div class="card"><h2>观测与点数据</h2><button onclick="loadPoints()">点数据</button><button onclick="loadObservations()">观测</button><button onclick="adjust()">执行平差</button><button onclick="loadResults()">平差结果</button><pre id="output">等待操作…</pre></div>
-<div class="card"><h2>审核发布</h2><p>通过 X-User / X-Role 模拟审核身份。示例：alice=editor，bob=reviewer。</p><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>viewer</option></select><button onclick="transition('submit')">提交复核</button><button onclick="transition('approve')">批准</button><button onclick="transition('publish')">发布</button></div>
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>大地测量网平差 · 观测复核</title>
+<style>
+body{font:14px/1.55 system-ui,sans-serif;max-width:1100px;margin:28px auto;padding:0 18px;color:#16202a}
+h1{margin-bottom:4px}
+h2{margin:0 0 10px;font-size:17px}
+.card{border:1px solid #d9e1e8;border-radius:10px;padding:14px 16px;margin:14px 0}
+input,select,button{padding:6px 9px;margin:2px;font:inherit}
+button{cursor:pointer;border-radius:6px;border:1px solid #9fb2c3;background:#fff}
+button:hover:not(:disabled){background:#eef4fa}
+button:disabled{opacity:.42;cursor:not-allowed}
+button.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
+button.warn{background:#d1242f;color:#fff;border-color:#d1242f}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #dde4ea;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f2f6fa}
+.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600}
+.pending{background:#fff3cd;color:#855f00}.confirmed{background:#d6f2de;color:#17622f}
+.returned{background:#fbd9dc;color:#8c1d24}.outlier{background:#e7e7ff;color:#3030a0}
+.valid{background:#eef1f4;color:#556}
+.muted{color:#667;font-size:12px}.reason{color:#8c1d24;font-size:12px;margin-top:3px}
+#message{min-height:20px;font-weight:600}
+#message.err{color:#b4232b}#message.ok{color:#17622f}
+.rowline{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+</style>
+</head>
+<body>
+<h1>大地测量网平差 · 观测逐条复核</h1>
+<p class="muted">编辑提交期次后，审核员逐条确认边长、角度和高差；可单条退回（已确认数据保持锁定）。编辑修正并重新平差后，只有变动记录和受影响精度结果重新送审，全部确认才能批准发布。</p>
+
+<div class="card">
+  <div class="rowline">
+    <label>期次 ID <input id="epoch" type="number" value="1" style="width:80px"></label>
+    <button class="primary" onclick="loadAll()">读取期次</button>
+    <label>身份 <input id="user" value="alice" style="width:110px"></label>
+    <select id="role"><option value="editor">editor 编辑</option><option value="reviewer">reviewer 审核员</option><option value="viewer">viewer 查看者</option></select>
+    <button onclick="loadAll()">刷新</button>
+    <span id="message"></span>
+  </div>
+  <div id="epochInfo" class="muted" style="margin-top:8px"></div>
+</div>
+
+<div class="card">
+  <h2>期次操作</h2>
+  <div class="rowline">
+    <button id="btnAdjust" class="primary" onclick="adjust()">重新平差</button>
+    <button id="btnSubmit" onclick="transition('submit')">提交复核</button>
+    <button id="btnApprove" onclick="transition('approve')">批准（全部确认后）</button>
+    <button id="btnPublish" class="primary" onclick="transition('publish')">发布</button>
+  </div>
+  <p class="muted" id="workflowHint">平差后才能提交；退回观测修正并重新平差后可再次提交。</p>
+</div>
+
+<div class="card">
+  <h2>观测逐条复核</h2>
+  <table>
+    <thead><tr><th>ID</th><th>类型</th><th>端点</th><th>观测值</th><th>权</th><th>平差状态/残差</th><th>复核状态</th><th>操作</th></tr></thead>
+    <tbody id="obsBody"><tr><td colspan="8" class="muted">请先读取期次</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>点位坐标与精度结果复核</h2>
+  <table>
+    <thead><tr><th>点号</th><th>X</th><th>Y</th><th>高程</th><th>σX</th><th>σY</th><th>σH</th><th>复核状态</th><th>操作</th></tr></thead>
+    <tbody id="resultBody"><tr><td colspan="9" class="muted">执行平差后显示</td></tr></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>补录观测（仅草稿期，编辑）</h2>
+  <div class="rowline">
+    <select id="nKind"><option value="distance">distance 边长</option><option value="angle">angle 角度</option><option value="height_difference">height_difference 高差</option></select>
+    <input id="nP1" placeholder="起点 P1" style="width:80px"><input id="nP2" placeholder="端点 P2" style="width:80px">
+    <input id="nP3" placeholder="角点 P3（角度）" style="width:110px">
+    <input id="nValue" placeholder="观测值" type="number" style="width:110px">
+    <input id="nWeight" placeholder="权" type="number" value="1" style="width:70px">
+    <label class="muted"><input id="nDup" type="checkbox">允许重复</label>
+    <button onclick="addObs()">补录</button>
+  </div>
+</div>
+
 <script>
-const out=document.querySelector('#output'), status=document.querySelector('#status');
-const headers=()=>({'Content-Type':'application/json','X-User':document.querySelector('#user').value,'X-Role':document.querySelector('#role').value});
-async function req(url,opts={}){const r=await fetch(url,opts);const j=await r.json();out.textContent=JSON.stringify(j,null,2);if(!r.ok)throw Error(j.error||r.status);return j}
-async function loadEpoch(){try{const j=await req('/api/epochs/'+epoch.value);status.textContent=' '+j.status}catch(e){status.textContent=' '+e.message}}
-async function loadPoints(){await req('/api/epochs/'+epoch.value+'/points')}
-async function loadObservations(){await req('/api/epochs/'+epoch.value+'/observations')}
-async function loadResults(){await req('/api/epochs/'+epoch.value+'/results')}
-async function adjust(){await req('/api/epochs/'+epoch.value+'/adjust',{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
-async function transition(action){await req('/api/epochs/'+epoch.value+'/transition/'+action,{method:'POST',headers:headers(),body:'{}'});loadEpoch()}
-</script></body></html>
+const $=id=>document.getElementById(id);
+const msg=$('message'), epochInfo=$('epochInfo');
+let epochData=null, observations=[], resultList=[];
+const kindLabel={distance:'边长',angle:'角度',height_difference:'高差'};
+const reviewLabel={pending:'待复核',confirmed:'已确认',returned:'已退回'};
+
+function h(){return {'Content-Type':'application/json','X-User':$('user').value.trim()||'anonymous','X-Role':$('role').value}}
+function epochId(){return parseInt($('epoch').value,10)}
+function role(){return $('role').value}
+function setMessage(text,ok){msg.textContent=text||'';msg.className=ok?'ok':(text?'err':'')}
+
+async function api(url,opts={}){
+  const r=await fetch(url,{headers:h(),...opts});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+  return j;
+}
+
+async function loadAll(){
+  setMessage('');
+  try{
+    const id=epochId();
+    epochData=await api('/api/epochs/'+id);
+    const [oj,rj]=await Promise.all([
+      api('/api/epochs/'+id+'/observations'),
+      api('/api/epochs/'+id+'/results')
+    ]);
+    observations=oj.observations||[];
+    resultList=rj.results||[];
+    renderEpoch();renderObservations();renderResults();
+  }catch(e){setMessage(e.message,false)}
+}
+
+function renderEpoch(){
+  if(!epochData)return;
+  const s=epochData.status;
+  epochInfo.innerHTML=`期次 <b>${epochData.name}</b> · 状态 <b>${s}</b> · 创建 ${epochData.created_by} · 提交 ${epochData.submitted_by||'—'} · 批准 ${epochData.approved_by||'—'}`
+    +(epochData.adjust_required?' · <span class="reason">观测有变动，需重新平差</span>':'');
+  const isEditor=role()==='editor', isReviewer=role()==='reviewer';
+  $('btnAdjust').disabled=!(isEditor&&s==='draft');
+  $('btnSubmit').disabled=!(isEditor&&s==='draft');
+  $('btnApprove').disabled=!(isReviewer&&s==='review');
+  $('btnPublish').disabled=!(isReviewer&&s==='approved');
+}
+
+function endpoints(o){return [o.p1,o.p2,o.p3].filter(Boolean).join(' → ')}
+function fmt(v){return v==null?'—':(Math.round(v*1e6)/1e6)}
+
+function actionButtons(o){
+  const s=epochData.status, r=role();
+  let html='';
+  if(s==='review'&&r==='reviewer'){
+    if(o.review_status==='pending'){
+      html+=`<button class="primary" onclick="confirmObs(${o.id})">确认通过</button>`;
+      html+=`<button class="warn" onclick="returnObs(${o.id})">退回</button>`;
+    }else if(o.review_status==='confirmed'){
+      html=`<span class="muted">已锁定</span>`;
+    }else if(o.review_status==='returned'){
+      html=`<span class="muted">退回中</span>`;
+    }
+  }else if(s==='draft'&&r==='editor'&&epochData.review_started){
+    if(o.review_status==='returned'){
+      html+=`<button onclick="editObs(${o.id})">修正</button>`;
+      html+=`<button class="warn" onclick="deleteObs(${o.id})">删除</button>`;
+    }else{
+      html=`<span class="muted">锁定</span>`;
+    }
+  }else if(s==='draft'&&r==='editor'&&!epochData.review_started){
+    html+=`<button onclick="editObs(${o.id})">编辑</button>`;
+  }else{
+    html=`<span class="muted">—</span>`;
+  }
+  return html;
+}
+
+function renderObservations(){
+  const tb=$('obsBody');
+  if(!observations.length){tb.innerHTML='<tr><td colspan="8" class="muted">暂无观测</td></tr>';return}
+  tb.innerHTML=observations.map(o=>`
+    <tr>
+      <td>${o.id}</td>
+      <td>${kindLabel[o.kind]||o.kind}</td>
+      <td>${endpoints(o)}</td>
+      <td>${fmt(o.value)}</td>
+      <td>${fmt(o.weight)}</td>
+      <td><span class="badge ${o.status}">${o.status==='valid'?'有效':'异常'}</span><div class="muted">残差 ${o.residual==null?'—':fmt(o.residual)}</div></td>
+      <td><span class="badge ${o.review_status}">${reviewLabel[o.review_status]||o.review_status}</span>
+          ${o.reviewed_by?`<div class="muted">${o.reviewed_by}${o.reviewed_at?' · '+o.reviewed_at:''}</div>`:''}
+          ${o.review_reason?`<div class="reason">退回原因：${escapeHtml(o.review_reason)}</div>`:''}</td>
+      <td>${actionButtons(o)}</td>
+    </tr>`).join('');
+}
+
+function renderResults(){
+  const tb=$('resultBody');
+  if(!resultList.length){tb.innerHTML='<tr><td colspan="9" class="muted">尚无平差结果，请先执行平差</td></tr>';return}
+  const inReview=epochData.status==='review', isReviewer=role()==='reviewer';
+  tb.innerHTML=resultList.map(x=>{
+    const canConfirm=inReview&&isReviewer&&x.review_status!=='confirmed';
+    return `<tr>
+      <td>${x.point}</td><td>${fmt(x.x)}</td><td>${fmt(x.y)}</td><td>${fmt(x.elevation)}</td>
+      <td>${fmt(x.sigma_x)}</td><td>${fmt(x.sigma_y)}</td><td>${fmt(x.sigma_elevation)}</td>
+      <td><span class="badge ${x.review_status}">${reviewLabel[x.review_status]||x.review_status}</span>
+          ${x.reviewed_by?`<div class="muted">${x.reviewed_by}</div>`:''}
+          ${x.review_reason?`<div class="reason">${escapeHtml(x.review_reason)}</div>`:''}</td>
+      <td>${x.review_status==='confirmed'?'<span class="muted">已锁定</span>':(canConfirm?`<button class="primary" onclick="confirmResult('${x.point}')">确认精度</button>`:'<span class="muted">—</span>')}</td>
+    </tr>`;
+  }).join('');
+}
+
+function escapeHtml(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+async function transition(action){
+  try{setMessage('');await api('/api/epochs/'+epochId()+'/transition/'+action,{method:'POST',body:'{}'});await loadAll();setMessage('操作成功：'+action,true)}
+  catch(e){setMessage(e.message,false)}
+}
+async function adjust(){
+  try{setMessage('');const j=await api('/api/epochs/'+epochId()+'/adjust',{method:'POST',body:'{}'});await loadAll();setMessage(`平差完成，RMS=${Math.round(j.residual_rms*1e6)/1e6}；受影响点：${(j.affected_points||[]).join('、')||'无'}`,true)}
+  catch(e){setMessage(e.message,false)}
+}
+async function confirmObs(id){
+  try{await api(`/api/epochs/${epochId()}/observations/${id}/confirm`,{method:'POST',body:'{}'});await loadAll();setMessage('已确认通过，记录保持锁定',true)}
+  catch(e){setMessage(e.message,false)}
+}
+async function returnObs(id){
+  const reason=prompt('请输入该观测的退回原因（必填）：');
+  if(reason===null)return;
+  try{await api(`/api/epochs/${epochId()}/observations/${id}/return`,{method:'POST',body:JSON.stringify({reason})});await loadAll();setMessage('该观测已退回，整期回到可修改状态，其他已确认数据不变',true)}
+  catch(e){setMessage(e.message,false)}
+}
+async function editObs(id){
+  const o=observations.find(x=>x.id===id);
+  const value=prompt('新的观测值：',o.value);
+  if(value===null)return;
+  const weight=prompt('新的权：',o.weight);
+  if(weight===null)return;
+  try{
+    const j=await api(`/api/epochs/${epochId()}/observations/${id}`,{method:'PATCH',body:JSON.stringify({value:parseFloat(value),weight:parseFloat(weight)})});
+    await loadAll();setMessage('已修正，受影响点：'+(j.affected_points||[]).join('、')+'，请重新平差',true);
+  }catch(e){setMessage(e.message,false)}
+}
+async function deleteObs(id){
+  if(!confirm('确定删除这条退回观测？'))return;
+  try{await api(`/api/epochs/${epochId()}/observations/${id}`,{method:'DELETE'});await loadAll();setMessage('已删除，请重新平差',true)}
+  catch(e){setMessage(e.message,false)}
+}
+async function confirmResult(point){
+  try{await api(`/api/epochs/${epochId()}/results/${encodeURIComponent(point)}/confirm`,{method:'POST',body:'{}'});await loadAll();setMessage('精度结果已确认',true)}
+  catch(e){setMessage(e.message,false)}
+}
+async function addObs(){
+  const payload={kind:$('nKind').value,p1:$('nP1').value,p2:$('nP2').value,p3:$('nP3').value||null,
+    value:parseFloat($('nValue').value),weight:parseFloat($('nWeight').value||'1'),allow_duplicate:$('nDup').checked};
+  try{const j=await api('/api/epochs/'+epochId()+'/observations',{method:'POST',body:JSON.stringify(payload)});await loadAll();setMessage('已补录观测 #'+j.id+'，需重新平差后提交',true)}
+  catch(e){setMessage(e.message,false)}
+}
+loadAll();
+</script>
+</body>
+</html>
